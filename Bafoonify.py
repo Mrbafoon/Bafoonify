@@ -9,105 +9,105 @@ from spotipy.oauth2 import SpotifyOAuth
 import random
 from dotenv import load_dotenv
 import os
+import streamlit as st
 
-#enviornment variables
+# environment variables
 load_dotenv()
 
-#Set your credentials here from spotify developer website, you can use your own .env file if you'd like.
-SPOTIPY_CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")      
-SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")  
+# Set your credentials here from spotify developer website or .env file
+SPOTIPY_CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
+SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
 SPOTIPY_REDIRECT_URI = os.getenv("SPOTIPY_REDIRECT_URI")
 
-
-#Authentication
-scope = "user-top-read playlist-read-private" 
+# Authentication
+scope = "user-top-read playlist-read-private"
 
 sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-
     client_id=SPOTIPY_CLIENT_ID,
     client_secret=SPOTIPY_CLIENT_SECRET,
     redirect_uri=SPOTIPY_REDIRECT_URI,
-
     scope=scope
 ))
 
-def Guess_Artist():
-    #List your playlists and let you choose one
-    playlists = sp.current_user_playlists()
-    playlist_map = {i: playlist for i, playlist in enumerate(playlists['items'])}
 
-    print("Your Playlists:")
-    for i, playlist in playlist_map.items():
-        print(f"{i}: {playlist['name']} ({playlist['tracks']['total']} tracks)")
-
-    chosen_index = int(input("Choose a playlist number: "))
-    chosen_playlist = playlist_map[chosen_index]
-
-
-    #Get all tracks in the chosen playlist
+def _get_playlist_tracks(playlist_id):
     tracks = []
-    results = sp.playlist_tracks(chosen_playlist['id'])
-    tracks.extend(results['items'])
-
-    while results['next']:
+    results = sp.playlist_tracks(playlist_id)
+    tracks.extend(results.get('items', []))
+    while results.get('next'):
         results = sp.next(results)
-        tracks.extend(results['items'])
-
-    #Filter out tracks with missing info
-    valid_tracks = [t['track'] for t in tracks if t['track'] and t['track']['artists']]
-
-    #Pick a random song and run the quiz
-    random_song = random.choice(valid_tracks)
-    song_name = random_song['name']
-    artist_name = random_song['artists'][0]['name']
-
-    #quiz question
-    print(f"\nWho is the artist of the song: \"{song_name}\"?")
-    guess = input("Your answer: ").strip()
-
-    if guess.lower() == artist_name.lower():
-        print("Correct ദ്ദി( • ᴗ - ) ✧")
-    else:
-        print(f"Incorrect. The artist is: {artist_name}")
-    pass 
+        tracks.extend(results.get('items', []))
+    return [t.get('track') for t in tracks if t.get('track')]
 
 
-def view_artists():
-    return sp.current_user_top_artists(limit=10)
+def Guess_Artist_ui():
+    playlists_resp = sp.current_user_playlists(limit=50)
+    playlists = playlists_resp.get("items", [])
 
-def view_songs():
-    return sp.current_user_top_tracks(limit=10)
+    if not playlists:
+        st.info("No playlists found for your account.")
+        return
 
-def main_menu():
-    while True:
-        print("\nSpotify App:")
-        print("1. Guess the Artist")
-        print("2. View Top Artists")
-        print("3. View Top Songs")
-        print("4. Exit")
+    playlist_names = [p.get("name", "Unknown") for p in playlists]
+    chosen_name = st.selectbox("Choose a playlist", playlist_names)
+    chosen = playlists[playlist_names.index(chosen_name)]
 
-        choice = input("Choose an option: ")
+    if "game_song" not in st.session_state:
+        st.session_state.game_song = None
+        st.session_state.guess = ""
 
-        if choice == "1":
-            Guess_Artist()
-        elif choice == "2":
-            stats = view_artists()
-
-            print("\nYour Top Artists:")
-            for i, artist in enumerate(stats["items"], 1):
-                print(f"{i}. {artist['name']}")
-        elif choice == "3":
-            stats = view_songs()
-
-            print("\nYour Top Songs:")
-            for i, track in enumerate(stats["items"], 1):
-                print(f"{i}. {track['name']}")
-        elif choice == "4":
-            break
+    if st.button("Pick Random Song", key="pick_song"):
+        all_tracks = _get_playlist_tracks(chosen['id'])
+        valid_tracks = [t for t in all_tracks if t and t.get('artists')]
+        if not valid_tracks:
+            st.warning("No valid tracks found in this playlist.")
         else:
-            print("Only accepts 1, 2, 3, or 4 as input.")
+            song = random.choice(valid_tracks)
+            st.session_state.game_song = {"name": song.get('name'), "artist": song.get('artists', [{}])[0].get('name')}
+            st.session_state.guess = ""
 
-main_menu()
+    if st.session_state.game_song:
+        st.write("**Guess the artist**")
+        st.write(f"Song: {st.session_state.game_song['name']}")
+        st.session_state.guess = st.text_input("Your answer", value=st.session_state.guess, key="guess_input")
+        if st.button("Submit Guess", key="submit_guess"):
+            answer = st.session_state.game_song.get('artist') or "Unknown"
+            if st.session_state.guess.strip().lower() == answer.strip().lower():
+                st.success("Correct! 🎉")
+                st.session_state.game_song = None
+            else:
+                st.error(f"Incorrect. The artist is: {answer}")
+
+
+def Top_Artists_ui():
+    time_range = st.selectbox("Select Time Range", ["short_term", "medium_term", "long_term"])
+    if st.button("Show Top Artists", key="show_artists"):
+        top_artists = sp.current_user_top_artists(limit=10, time_range=time_range)
+        for i, artist in enumerate(top_artists.get("items", []), 1):
+            st.write(f"{i}. {artist.get('name')}")
+
+
+def Top_Tracks_ui():
+    time_range = st.selectbox("Select Time Range", ["short_term", "medium_term", "long_term"], key="tracks_time")
+    if st.button("Show Top Tracks", key="show_tracks"):
+        top_tracks = sp.current_user_top_tracks(limit=10, time_range=time_range)
+        for i, track in enumerate(top_tracks.get("items", []), 1):
+            st.write(f"{i}. {track.get('name')} - {track.get('artists', [{}])[0].get('name')}")
+
+
+st.title("🎵 Spotify Game & Stats App")
+
+menu = st.sidebar.selectbox("Choose Mode", ["Artist Guessing Game", "Top Artists", "Top Tracks"])
+if menu == "Artist Guessing Game":
+    st.header("Artist Guessing Game")
+    Guess_Artist_ui()
+elif menu == "Top Artists":
+    st.header("Your Top Artists")
+    Top_Artists_ui()
+elif menu == "Top Tracks":
+    st.header("Your Top Tracks")
+    Top_Tracks_ui()
+
 
 
 # 
