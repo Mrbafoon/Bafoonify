@@ -29,7 +29,6 @@ sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
     scope=scope
 ))
 
-
 def _get_playlist_tracks(playlist_id):
     tracks = []
     results = sp.playlist_tracks(playlist_id)
@@ -73,10 +72,10 @@ def Guess_Artist_ui():
         if st.button("Submit Guess", key="submit_guess"):
             answer = st.session_state.game_song.get('artist') or "Unknown"
             if st.session_state.guess.strip().lower() == answer.strip().lower():
-                st.success("Correct! 🎉")
+                st.success("Correct ദ്ദി( • ᴗ - ) ✧")
                 st.session_state.game_song = None
             else:
-                st.error(f"Incorrect. The artist is: {answer}")
+                st.error(f"Incorrect (╥﹏╥) | The artist is: {answer}")
 
 
 def Top_Artists_ui():
@@ -95,7 +94,7 @@ def Top_Tracks_ui():
             st.write(f"{i}. {track.get('name')} - {track.get('artists', [{}])[0].get('name')}")
 
 
-st.title("🎵 Spotify Game & Stats App")
+st.title("Bafoonify")
 
 menu = st.sidebar.selectbox("Choose Mode", ["Artist Guessing Game", "Top Artists", "Top Tracks"])
 if menu == "Artist Guessing Game":
@@ -107,13 +106,5 @@ elif menu == "Top Artists":
 elif menu == "Top Tracks":
     st.header("Your Top Tracks")
     Top_Tracks_ui()
-
-
-
-# 
-
-# In[ ]:
-
-
 
 
