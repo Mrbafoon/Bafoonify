@@ -62,9 +62,22 @@ def get_playlist_tracks(playlist_id):
     return [t.get('track') for t in tracks if t.get('track')]
 
 def get_playlist_tracks_items(playlist_id):
-    fields = ("items(added_at,track(id,name,artists(id,name),album(name,release_date),duration_ms,popularity,external_urls,uri,is_local)),next")
+    fields = ("items(added_at,track(id,name,type,artists(id,name),album(name,release_date),duration_ms,popularity,external_urls,uri,is_local)),next")
     output = sp.playlist_items(playlist_id, limit=50, fields=fields)
     return paginate(output)
+
+def get_playlist_snapshot_id(playlist_id):
+    return sp.playlist(playlist_id, fields="snapshot_id").get("snapshot_id")
+
+def get_consistent_playlist_tracks_items(playlist_id, attempts=2):
+    for i in range(attempts):
+        snapshot_before = get_playlist_snapshot_id(playlist_id)
+        items = get_playlist_tracks_items(playlist_id)
+        snapshot_after = get_playlist_snapshot_id(playlist_id)
+        if snapshot_before == snapshot_after:
+            return items, snapshot_after
+        
+    raise RuntimeError("Playlist changed during fetching. Try again.")
 
 def get_top_artists(time_range, limit):
     return sp.current_user_top_artists(limit=limit, time_range=time_range).get("items", [])
@@ -123,18 +136,69 @@ def load_spotify_extended_history(uploaded_files):
                 
     return pd.DataFrame(rows)
 
-def remove_extra_playlist_duplicates(playlist_id, rows_to_remove):
-    items = []
+def remove_extra_playlist_duplicates(playlist_id, playlist_rows, rows_to_remove, snapshot_id=None):
+    if rows_to_remove.empty:
+        return None
 
-    for _, row in rows_to_remove.iterrows():
-        if pd.isna(row.get("uri")) or pd.isna(row.get("spotify_position")):
-            continue
-        items.append({"uri": row["uri"],"positions": [int(row["spotify_position"])]})
+    ordered_rows = playlist_rows.sort_values("spotify_position").copy()
+    selected_rows = rows_to_remove.sort_values("spotify_position").copy()
+    if selected_rows["uri"].isna().any():
+        raise RuntimeError("Some songs to remove have missing URIs.")
+    
+    positions_to_remove = {
+        int(position) for position in selected_rows["spotify_position"].tolist()
+        if pd.notna(position)}
 
-    if not items:
+    if not positions_to_remove:
         return None
     
-    return sp.playlist_remove_specific_occurrences_of_items(playlist_id,items)
+    known_positions = set(ordered_rows["spotify_position"].astype(int))
+    if not positions_to_remove.issubset(known_positions):
+        raise RuntimeError("Some positions to remove are not in the playlist.")
+    
+    uri_by_position = {int(row["spotify_position"]): row["uri"] 
+        for i, row in ordered_rows.iterrows()}
+
+    for i, row in selected_rows.iterrows():
+        position = int(row["spotify_position"])
+        if uri_by_position[position] != row["uri"]:
+            raise RuntimeError("URI mismatch for position.")
+    
+    current_snapshot_id = get_playlist_snapshot_id(playlist_id)
+    if snapshot_id and current_snapshot_id != snapshot_id:
+        raise RuntimeError("Playlist has been modified since the last snapshot. Try again.")
+# Spotify's current remove-items endpoint removes every occurrence of a URI, 
+# so we put songs back into the playlist that we're not supposed to be removed.
+    target_uris = list(dict.fromkeys(selected_rows["uri"].tolist()))
+    if any(not str(uri).startswith("spotify:track:") for uri in target_uris):
+        raise RuntimeError("One or more selected items can't be removed.")
+
+    retained_rows = ordered_rows[
+        ordered_rows["uri"].isin(target_uris)
+        & ~ordered_rows["spotify_position"].astype(int).isin(positions_to_remove)].copy()
+
+    next_snapshot_id = snapshot_id
+    for index in range(0, len(target_uris), 100):
+        response = sp.playlist_remove_all_occurrences_of_items(
+            playlist_id,
+            target_uris[index:index + 100],
+            snapshot_id=next_snapshot_id)
+        if response and response.get("snapshot_id"):
+            next_snapshot_id = response["snapshot_id"]
+
+    sorted_removed_positions = sorted(positions_to_remove)
+    for i, row in retained_rows.sort_values("spotify_position").iterrows():
+        original_position = int(row["spotify_position"])
+        removed_before = sum(
+            position < original_position
+            for position in sorted_removed_positions)
+        final_position = original_position - removed_before
+        sp.playlist_add_items(
+            playlist_id,
+            [row["uri"]],
+            position=final_position)
+
+    return len(positions_to_remove)
 
 def get_extra_duplicate_rows(df):
 
@@ -154,7 +218,7 @@ def get_extra_duplicate_rows(df):
 def remove_extra_liked_song_duplicates(rows_to_remove):
     track_ids = []
 
-    for _, row in rows_to_remove.iterrows():
+    for i, row in rows_to_remove.iterrows():
         track_id = row.get("track_id")
 
         if pd.notna(track_id):
@@ -167,7 +231,7 @@ def remove_extra_liked_song_duplicates(rows_to_remove):
         batch = track_ids[i:i + 40]
         sp.current_user_saved_tracks_delete(tracks=batch)          
            
-def show_duplicates(df, playlist_id=None, source_type=None):
+def show_duplicates(df, playlist_id=None, source_type=None, snapshot_id=None):
     if df.empty:
         st.warning("No tracks found to scan.")
         return
@@ -183,9 +247,9 @@ def show_duplicates(df, playlist_id=None, source_type=None):
         return
 
     summary = (duplicates.groupby(["duplicate_key", "track_name", "first_artist"], as_index=False).agg(
-            copies=("track_name", "size"),
-            albums=("album", lambda x: ", ".join(sorted(set(str(v) for v in x if pd.notna(v))))),
-            positions=("position", lambda x: ", ".join(map(str, x))),).sort_values("copies", ascending=False))
+            copies = ("track_name", "size"),
+            albums = ("album", lambda x: ", ".join(sorted(set(str(v) for v in x if pd.notna(v))))),
+            positions = ("position", lambda x: ", ".join(map(str, x))),).sort_values("copies", ascending=False))
 
     st.subheader("Duplicates Summary")
     st.dataframe(summary[["track_name", "first_artist", "copies", "albums", "positions"]],width='stretch')   
@@ -196,8 +260,15 @@ def show_duplicates(df, playlist_id=None, source_type=None):
 
     st.subheader("Remove Duplicates")
     if source_type == "Playlist":
-        st.write(f"This will remove {len(rows_to_remove)} extra duplicate occurrence(s), leaving one copy of each duplicated song in your playlist.")
-        display_columns = [
+        st.write("Select the duplicate occurrences you want to remove.")
+
+        playlist_remove_options = duplicates.sort_values(["duplicate_key", "spotify_position"]).copy()
+        default_remove_positions = set(rows_to_remove["spotify_position"].astype(int))
+        playlist_remove_options["delete"] = (playlist_remove_options["spotify_position"]
+                                             .astype(int).isin(default_remove_positions))
+
+        editor_columns = [
+            "delete",
             "position",
             "track_name",
             "artists",
@@ -206,26 +277,56 @@ def show_duplicates(df, playlist_id=None, source_type=None):
             "popularity",
             "added_at",
             "spotify_url"]
+        editor_columns = [
+            col for col in editor_columns
+            if col in playlist_remove_options.columns]
 
-        display_columns = [col for col in display_columns if col in rows_to_remove.columns]
+        edited_rows = st.data_editor(
+            playlist_remove_options[editor_columns],
+            column_config = {
+                "delete": st.column_config.CheckboxColumn(
+                    "Delete",
+                    help = "Check this song to remove it.",
+                    default = False),
+                "spotify_url": st.column_config.LinkColumn("Spotify URL")},
+            disabled = [col for col in editor_columns if col != "delete"],
+            hide_index = True,
+            width = 'stretch',
+            key = f"playlist_duplicates_delete_editor_{playlist_id}_{snapshot_id}")
 
-        with st.expander("Preview songs that will be removed"):
-            st.dataframe(rows_to_remove.sort_values(["duplicate_key", "position"])[display_columns],width='stretch')
+        selected_positions = set(
+            edited_rows.loc[edited_rows["delete"] == True, "position"]
+            .astype(int))
+        final_rows_to_remove = playlist_remove_options[
+            playlist_remove_options["position"].astype(int)
+            .isin(selected_positions)].copy()
 
-        confirm = st.checkbox(
-            "Yes, remove these duplicate songs",
-            key=f"confirm_remove_dupes_{source_type}",)
+        st.write(f"Selected {len(final_rows_to_remove)} song occurrence(s) to remove.")
 
-        if st.button("Remove Extra Duplicates",key=f"remove_extra_dupes_{source_type}",disabled=not confirm):
-            with st.spinner("Removing duplicate songs..."):
+        if not final_rows_to_remove.empty:
+            selected_counts = final_rows_to_remove.groupby("duplicate_key").size()
+            duplicate_counts = duplicates.groupby("duplicate_key").size()
+            fully_selected_groups = [
+                key for key, count in selected_counts.items()
+                if count == duplicate_counts.get(key)]
+            if fully_selected_groups:
+                st.warning("Every copy is selected in one or more duplicate groups; those songs will be removed completely.")
+
+        confirm = st.checkbox("Yes, remove the selected songs",key=f"confirm_remove_playlist_dupes_{playlist_id}")
+
+        if st.button(
+                "Remove Selected Playlist Duplicates",
+                key = f"remove_selected_playlist_dupes_{playlist_id}",
+                disabled = not confirm or final_rows_to_remove.empty):
+            with st.spinner("Removing selected duplicate songs..."):
                 try:
-                    if source_type == "Playlist":
-                        remove_extra_playlist_duplicates(playlist_id, rows_to_remove)
+                    removed_count = remove_extra_playlist_duplicates(
+                        playlist_id,
+                        df,
+                        final_rows_to_remove,
+                        snapshot_id=snapshot_id)
 
-                    elif source_type == "Liked Songs":
-                        remove_extra_liked_song_duplicates(rows_to_remove)
-
-                    st.success(f"Removed {len(rows_to_remove)} duplicate songs")
+                    st.success(f"Removed {removed_count} selected songs")
 
                     st.session_state.pop("duplicate_scan", None)
                     st.rerun()
@@ -408,7 +509,7 @@ def top_tracks_ui():
 
 
 def duplicate_song_checker_ui():
-    st.write("This tool checks a playlist for duplicate songs based on the name of the song and the first artist listed under the song.")
+    st.write("This tool checks a playlist for duplicate songs based on the name of the song and the first artist listed under the song. MAKE SURE YOU REFRESH SPOTIFY DATA BEFORE DELETING SONGS.")
 
     source_type = st.radio("Check Duplicates In", ["Playlist", "Liked Songs"],horizontal=True)
     if source_type == "Playlist":
@@ -422,19 +523,24 @@ def duplicate_song_checker_ui():
 
         if st.button("Find Duplicate Songs in Playlist", key="find_playlist_dupes"):
             with st.spinner("Checking for duplicates..."):
-                items = get_playlist_tracks_items(chosen['id'])
+                items, snapshot_id = get_consistent_playlist_tracks_items(chosen['id'])
                 df = track_items_to_df(items, source_name=chosen_name)
 
                 st.session_state["duplicate_scan"] = {
                     "source_type": "playlist",
                     "playlist_id": chosen['id'],
                     "playlist_name": chosen_name,   
-                    "df": df}
+                    "df": df,
+                    "snapshot_id": snapshot_id}
                 
         scan = st.session_state.get("duplicate_scan") 
 
         if (scan and scan.get("source_type") == "playlist" and scan.get("playlist_id") == chosen['id']):
-            show_duplicates(scan.get("df"), playlist_id=scan.get("playlist_id"), source_type="Playlist")
+            show_duplicates(
+                scan.get("df"), 
+                snapshot_id=scan.get("snapshot_id"),
+                playlist_id=scan.get("playlist_id"), 
+                source_type="Playlist")
                 
     elif source_type == "Liked Songs":
         if st.button("Find Duplicate Liked Songs", key="find_liked_dupes"):
@@ -479,7 +585,6 @@ def top_genres_ui():
 
 
 def monthly_listening_ui():
-    st.header("Monthly Listening History")
     st.write("Upload your Spotify Extended Streaming History JSON files to see your monthly listening trends. " \
     "You can download these files from the Spotify website, go to account settings and under 'Account Privacy' there is a 'Download Your Data' section.")
 
